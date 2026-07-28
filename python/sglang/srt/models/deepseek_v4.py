@@ -2777,13 +2777,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            weights = list(weights)
-            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-            if exists_wo_a_scale:
-                logger.info("Execute dequant fp8 wo_a")
-                weights = _dequant_fp8_wo_a(weights)
-            else:
-                logger.info("Skip dequant fp8 wo_a")
+            weights = _dequant_fp8_wo_a(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -3160,17 +3154,42 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    weights_dict = dict(weights)
+    # Buffer only small scale tensors; yield all other weights immediately to
+    # avoid materializing the full checkpoint (~170 GB) into host RAM twice.
+    pending_scales: dict[str, torch.Tensor] = {}
+    pending_weights: dict[str, torch.Tensor] = {}
+    executed = False
 
-    for name in list(weights_dict.keys()):
-        if name not in weights_dict:
-            continue
-        if not name.endswith(".wo_a.weight"):
-            continue
-        scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
-        weight = weights_dict.pop(name)
-        scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
+    for name, tensor in weights:
+        if name.endswith(".wo_a.scale"):
+            weight_name = name.replace(".wo_a.scale", ".wo_a.weight")
+            if weight_name in pending_weights:
+                if not executed:
+                    logger.info("Execute dequant fp8 wo_a")
+                    executed = True
+                yield weight_name, _dequant_fp8(pending_weights.pop(weight_name), tensor)
+            else:
+                pending_scales[name] = tensor
+        elif name.endswith(".wo_a.weight"):
+            scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+            if scale_name in pending_scales:
+                if not executed:
+                    logger.info("Execute dequant fp8 wo_a")
+                    executed = True
+                yield name, _dequant_fp8(tensor, pending_scales.pop(scale_name))
+            else:
+                pending_weights[name] = tensor
+        else:
+            yield name, tensor
 
-    yield from weights_dict.items()
+    # flush any pairs where weight arrived before its scale
+    for weight_name, weight in list(pending_weights.items()):
+        scale_name = weight_name.replace(".wo_a.weight", ".wo_a.scale")
+        assert scale_name in pending_scales, f"Missing wo_a scale for {weight_name}"
+        if not executed:
+            logger.info("Execute dequant fp8 wo_a")
+            executed = True
+        yield weight_name, _dequant_fp8(weight, pending_scales.pop(scale_name))
+
+    if not executed:
+        logger.info("Skip dequant fp8 wo_a")
